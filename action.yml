@@ -1,0 +1,119 @@
+name: 'Setup Artifact Signing'
+description: >-
+  Reliably install and cache the ArtifactSigning PowerShell module used by
+  Azure Artifact Signing (formerly Trusted Signing), with architecture-aware
+  cache keys and a configurable module source. Does not sign anything itself -
+  run the official Azure/artifact-signing-action afterwards for that.
+author: 'johndow-42'
+
+inputs:
+  module-version:
+    description: 'Version of the ArtifactSigning PowerShell module to install.'
+    required: false
+    default: '0.1.8'
+  repository:
+    description: >-
+      Name of a PSRepository to install the module from. Must already be
+      registered (e.g. via Register-PSRepository) if not the default.
+    required: false
+    default: 'PSGallery'
+  cache:
+    description: 'Whether to cache the installed module across workflow runs.'
+    required: false
+    default: 'true'
+  install-retries:
+    description: 'Number of install attempts before failing, to absorb transient PSGallery/NuGet flakiness.'
+    required: false
+    default: '3'
+
+outputs:
+  cache-hit:
+    description: 'true if the module was restored from cache rather than freshly installed.'
+    value: ${{ steps.cache-module.outputs.cache-hit }}
+  cache-key:
+    description: 'The architecture-scoped cache key used for this run.'
+    value: ${{ steps.vars.outputs.cache-key }}
+  module-version:
+    description: 'The ArtifactSigning module version that was installed/restored.'
+    value: ${{ inputs.module-version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check runner OS
+      shell: pwsh
+      run: |
+        if ($env:RUNNER_OS -ne 'Windows') {
+          Write-Error "This action only supports Windows runners (the ArtifactSigning module and signtool are Windows-only). Current runner OS: '$env:RUNNER_OS'."
+          exit 1
+        }
+
+    - name: Resolve module path and architecture-scoped cache key
+      id: vars
+      shell: pwsh
+      run: |
+        $defaultPath = $env:PSModulePath -split ';' | Select-Object -First 1
+        "module-path=$defaultPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+        # RUNNER_ARCH is one of X86, X64, ARM, ARM64. Including it in the cache
+        # key is the fix for Azure/artifact-signing-action#146: without it, an
+        # x64 job and an arm64 job in the same matrix share one cache key and
+        # can restore an incompatible cached module for the other architecture.
+        $arch = $env:RUNNER_ARCH
+        if ([string]::IsNullOrWhiteSpace($arch)) { $arch = 'unknown' }
+        $key = "ArtifactSigning-${{ inputs.module-version }}-$arch"
+        "cache-key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        Write-Host "::notice::Resolved architecture-scoped cache key: $key (runner arch: $arch)"
+
+    - name: Cache ArtifactSigning module
+      id: cache-module
+      if: ${{ inputs.cache == 'true' }}
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.vars.outputs.module-path }}\ArtifactSigning\${{ inputs.module-version }}
+        key: ${{ steps.vars.outputs.cache-key }}
+
+    - name: Report cache outcome
+      if: ${{ inputs.cache == 'true' }}
+      shell: pwsh
+      run: |
+        if ('${{ steps.cache-module.outputs.cache-hit }}' -eq 'true') {
+          Write-Host "::notice::ArtifactSigning module restored from cache (key: ${{ steps.vars.outputs.cache-key }})."
+        } else {
+          Write-Host "::notice::No cache hit for key '${{ steps.vars.outputs.cache-key }}' - installing fresh. Note: actions/cache's own cache-save step can fail silently after a successful job (see Azure/artifact-signing-action#141) - if you keep seeing misses across runs that should be hits, check the 'Post Cache ArtifactSigning module' step's log for a save warning, this action cannot detect that failure from the caching step itself."
+        }
+
+    - name: Verify custom repository is registered
+      if: ${{ inputs.repository != 'PSGallery' }}
+      shell: pwsh
+      run: |
+        if (-not (Get-PSRepository -Name '${{ inputs.repository }}' -ErrorAction SilentlyContinue)) {
+          Write-Error "PSRepository '${{ inputs.repository }}' is not registered on this runner. Register it (Register-PSRepository) in a step before this action - this action does not create repositories for you, only points Install-Module at one that already exists. This is the fix for Azure/artifact-signing-action#155 (hardcoded PSGallery endpoint with no override)."
+          exit 1
+        }
+
+    - name: Install ArtifactSigning module
+      if: ${{ inputs.cache != 'true' || steps.cache-module.outputs.cache-hit != 'true' }}
+      shell: pwsh
+      run: |
+        $maxAttempts = [int]'${{ inputs.install-retries }}'
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+          try {
+            Install-Module -Name ArtifactSigning -RequiredVersion '${{ inputs.module-version }}' -Repository '${{ inputs.repository }}' -Force -ErrorAction Stop
+            Write-Host "::notice::Installed ArtifactSigning ${{ inputs.module-version }} from '${{ inputs.repository }}' on attempt $attempt."
+            break
+          } catch {
+            if ($attempt -eq $maxAttempts) {
+              Write-Error "Failed to install ArtifactSigning module after $maxAttempts attempts: $($_.Exception.Message)"
+              throw
+            }
+            Write-Warning "Install attempt $attempt/$maxAttempts failed: $($_.Exception.Message). Retrying in $(5 * $attempt)s..."
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+        }
+
+    - name: Verify module is importable
+      shell: pwsh
+      run: |
+        Import-Module ArtifactSigning -RequiredVersion '${{ inputs.module-version }}' -ErrorAction Stop
+        Write-Host "::notice::ArtifactSigning ${{ inputs.module-version }} imported successfully."

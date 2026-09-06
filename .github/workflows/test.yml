@@ -1,0 +1,167 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  install-and-cache:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: First run
+        id: first
+        uses: ./
+        with:
+          module-version: '0.1.8'
+
+      # Not asserting cache-hit==false here: GitHub Actions cache persists across
+      # workflow runs (not just within one run), so whether this specific run is a
+      # miss depends on CI history, not on this action's own logic. The behavior
+      # this project actually needs to prove - that a hit on one architecture
+      # doesn't satisfy the other, and that a same-architecture rerun does hit - is
+      # covered by the arch-key assertion below and the cache-hit-on-second-run job.
+
+      - name: Assert cache key contains this runner's architecture
+        shell: pwsh
+        run: |
+          $key = '${{ steps.first.outputs.cache-key }}'
+          $arch = $env:RUNNER_ARCH
+          if ($key -notlike "*-$arch") {
+            Write-Error "Expected cache key '$key' to end with runner arch '$arch'."
+            exit 1
+          }
+          Write-Host "OK: cache key '$key' is scoped to arch '$arch'"
+
+      - name: Assert module is actually importable after install
+        shell: pwsh
+        run: |
+          Import-Module ArtifactSigning -RequiredVersion '0.1.8' -ErrorAction Stop
+          if (-not (Get-Command Invoke-ArtifactSigning -ErrorAction SilentlyContinue)) {
+            Write-Error "Invoke-ArtifactSigning command not found after import."
+            exit 1
+          }
+          Write-Host "OK: ArtifactSigning module imported, Invoke-ArtifactSigning is available"
+
+  cache-hit-on-second-run:
+    needs: install-and-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Second run on same architecture (expect cache hit)
+        id: second
+        uses: ./
+        with:
+          module-version: '0.1.8'
+
+      - name: Assert cache hit
+        shell: pwsh
+        run: |
+          if ('${{ steps.second.outputs.cache-hit }}' -ne 'true') {
+            Write-Error "Expected a cache hit on the second run for the same architecture, got a miss. Cache key: ${{ steps.second.outputs.cache-key }}"
+            exit 1
+          }
+          Write-Host "OK: second run on the same architecture was a cache hit (key: ${{ steps.second.outputs.cache-key }})"
+
+  custom-repository:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and publish a fake ArtifactSigning module to a local test repository
+        shell: pwsh
+        run: |
+          # NOTE: Publish-Module (PowerShellGet 2.2.x) has a known bug - "Failed to
+          # generate the compressed file for module 'Cannot index into a null array.'"
+          # - triggered by non-English locale/CLI output parsing. GitHub-hosted runners
+          # default to en-US so this shouldn't trigger, but we pin it explicitly since
+          # it cost real debugging time to track down (verified locally: reproduces
+          # under a German locale, disappears under en-US).
+          [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::new('en-US')
+          [System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::new('en-US')
+          $env:DOTNET_CLI_UI_LANGUAGE = 'en'
+
+          $repoPath = Join-Path $env:RUNNER_TEMP 'local-psrepo'
+          New-Item -Path $repoPath -ItemType Directory -Force | Out-Null
+          Register-PSRepository -Name LocalTestRepo -SourceLocation $repoPath -PublishLocation $repoPath -InstallationPolicy Trusted
+
+          # Publish-Module requires the source directory name to exactly match the
+          # module name, and requires non-empty Author/Description to package cleanly
+          # (both verified locally - omitting either breaks publish in different ways).
+          $moduleDir = Join-Path $env:RUNNER_TEMP 'fake-module-src\ArtifactSigning'
+          New-Item -Path $moduleDir -ItemType Directory -Force | Out-Null
+          New-ModuleManifest -Path (Join-Path $moduleDir 'ArtifactSigning.psd1') -RootModule 'ArtifactSigning.psm1' -ModuleVersion '0.0.1' -FunctionsToExport @('Invoke-ArtifactSigning') -Author 'test' -Description 'fake module for CI test'
+          Set-Content -Path (Join-Path $moduleDir 'ArtifactSigning.psm1') -Value 'function Invoke-ArtifactSigning { Write-Host "FAKE-MODULE-FROM-LOCALTESTREPO" }'
+
+          Publish-Module -Path $moduleDir -Repository LocalTestRepo -NuGetApiKey 'unused-for-local-file-repo'
+
+      - name: Run action against the custom repository
+        id: custom
+        uses: ./
+        with:
+          module-version: '0.0.1'
+          repository: 'LocalTestRepo'
+          cache: 'false'
+
+      - name: Assert the fake module (not a real PSGallery one) was installed
+        shell: pwsh
+        run: |
+          Import-Module ArtifactSigning -RequiredVersion '0.0.1' -ErrorAction Stop
+          $output = Invoke-ArtifactSigning 6>&1 | Out-String
+          if ($output -notlike '*FAKE-MODULE-FROM-LOCALTESTREPO*') {
+            Write-Error "Expected the module installed via the custom 'repository' input to be the local test fake, but got: $output"
+            exit 1
+          }
+          Write-Host "OK: custom repository input correctly routed Install-Module to LocalTestRepo instead of PSGallery"
+
+  reject-unregistered-repository:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run action with a repository name that was never registered
+        id: bad-repo
+        uses: ./
+        continue-on-error: true
+        with:
+          module-version: '0.1.8'
+          repository: 'ThisRepoDoesNotExist'
+
+      - name: Assert the action failed instead of silently falling back to PSGallery
+        shell: pwsh
+        run: |
+          if ('${{ steps.bad-repo.outcome }}' -ne 'failure') {
+            Write-Error "Expected the action to fail for an unregistered repository name, but it reported '${{ steps.bad-repo.outcome }}'."
+            exit 1
+          }
+          Write-Host "OK: action correctly failed fast for an unregistered repository instead of silently using PSGallery"
+
+  non-windows-runner-fails-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run action on Linux (expect a clear failure, not a confusing one)
+        id: linux
+        uses: ./
+        continue-on-error: true
+
+      - name: Assert it failed
+        shell: bash
+        run: |
+          if [ "${{ steps.linux.outcome }}" != "failure" ]; then
+            echo "Expected failure on a non-Windows runner, got ${{ steps.linux.outcome }}"
+            exit 1
+          fi
+          echo "OK: action fails fast and clearly on a non-Windows runner"
